@@ -1,0 +1,983 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 8c35479..0000000 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -161,6 +161,7 @@ register_model(serial SERIAL SerialStream.cpp)
+ register_model(omp OMP OMPStream.cpp)
+ register_model(ocl OCL OCLStream.cpp)
++register_model(vulkan VULKAN VulkanStream.cpp)
+ register_model(std STD STDStream.cpp)
+ register_model(hip HIP HIPStream.cpp)
+ register_model(cuda CUDA CUDAStream.cu)
+diff --git a/src/StreamModels.h b/src/StreamModels.h
+index 5268f2d..0000000 100644
+--- a/src/StreamModels.h
++++ b/src/StreamModels.h
+@@ -15,6 +15,8 @@
+ #include "HCStream.h"
+ #elif defined(OCL)
+ #include "OCLStream.h"
++#elif defined(VULKAN)
++#include "VulkanStream.h"
+ #elif defined(USE_RAJA)
+ #include "RAJAStream.hpp"
+ #elif defined(KOKKOS)
+@@ -50,6 +52,10 @@ std::unique_ptr<Stream<T>> make_stream(Args... args) {
+   // Use the OpenCL implementation
+   return std::make_unique<OCLStream<T>>(args...);
+ 
++#elif defined(VULKAN)
++  // Use the Vulkan implementation
++  return std::make_unique<VulkanStream<T>>(args...);
++
+ #elif defined(USE_RAJA)
+   // Use the RAJA implementation
+   return std::make_unique<RAJAStream<T>>(args...);
+diff --git a/src/vulkan/model.cmake b/src/vulkan/model.cmake
+new file mode 100644
+index 0000000..0000000
+--- /dev/null
++++ b/src/vulkan/model.cmake
+@@ -0,0 +1,58 @@
++
++register_flag_optional(CMAKE_CXX_COMPILER
++        "Any CXX compiler that is supported by CMake detection"
++        "c++")
++
++register_flag_optional(SLANGC_EXECUTABLE
++        "Path to the Slang compiler executable"
++        "slangc")
++
++macro(setup)
++    set(CMAKE_CXX_STANDARD 17)
++    find_package(Vulkan REQUIRED)
++    register_link_library(Vulkan::Vulkan)
++endmacro()
++
++macro(setup_target NAME)
++    if (IS_ABSOLUTE "${SLANGC_EXECUTABLE}")
++        set(_slangc "${SLANGC_EXECUTABLE}")
++    else ()
++        find_program(_slangc NAMES "${SLANGC_EXECUTABLE}" REQUIRED)
++    endif ()
++
++    set(_shader_src "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/stream.slang")
++    set(_shader_dir "${CMAKE_CURRENT_BINARY_DIR}/vulkan-shaders")
++    file(MAKE_DIRECTORY "${_shader_dir}/float")
++    file(MAKE_DIRECTORY "${_shader_dir}/double")
++
++    set(_entries init copy mul add triad nstream dot)
++    set(_outputs)
++
++    foreach (_precision IN ITEMS float double)
++        if (_precision STREQUAL "double")
++            set(_use_double 1)
++        else ()
++            set(_use_double 0)
++        endif ()
++
++        foreach (_entry IN LISTS _entries)
++            set(_out "${_shader_dir}/${_precision}/${_entry}.spv")
++            add_custom_command(
++                OUTPUT "${_out}"
++                COMMAND "${_slangc}"
++                        "${_shader_src}"
++                        -target spirv
++                        -profile spirv_1_5
++                        -stage compute
++                        -entry "${_entry}"
++                        -DUSE_DOUBLE=${_use_double}
++                        -o "${_out}"
++                DEPENDS "${_shader_src}"
++                VERBATIM
++            )
++            list(APPEND _outputs "${_out}")
++        endforeach ()
++    endforeach ()
++
++    add_custom_target(${NAME}_slang_shaders DEPENDS ${_outputs})
++    add_dependencies(${NAME} ${NAME}_slang_shaders)
++    target_compile_definitions(${NAME} PRIVATE VULKAN_SHADER_DIR=\"${_shader_dir}\")
++endmacro()
+diff --git a/src/vulkan/VulkanStream.h b/src/vulkan/VulkanStream.h
+new file mode 100644
+index 0000000..0000000
+--- /dev/null
++++ b/src/vulkan/VulkanStream.h
+@@ -0,0 +1,90 @@
++
++#pragma once
++
++#include <cstdint>
++#include <string>
++#include <vector>
++
++#include <vulkan/vulkan.hpp>
++
++#include "Stream.h"
++
++#define IMPLEMENTATION_STRING "Vulkan + Slang"
++
++template <class T>
++class VulkanStream : public Stream<T>
++{
++  struct Buffer {
++    vk::UniqueBuffer buffer;
++    vk::UniqueDeviceMemory memory;
++    vk::DeviceSize size{0};
++    void* mapped{nullptr};
++  };
++
++  struct Pipelines {
++    vk::UniquePipeline init;
++    vk::UniquePipeline copy;
++    vk::UniquePipeline mul;
++    vk::UniquePipeline add;
++    vk::UniquePipeline triad;
++    vk::UniquePipeline nstream;
++    vk::UniquePipeline dot;
++  };
++
++  struct alignas(16) ShaderParams {
++    uint32_t elementCount;
++    uint32_t gridSize;
++    T initA;
++    T initB;
++    T initC;
++    T scalar;
++  };
++
++  intptr_t array_size;
++  T initA_;
++  T initB_;
++  T initC_;
++  T scalar_;
++
++  vk::UniqueInstance instance;
++  vk::PhysicalDevice physicalDevice;
++  vk::UniqueDevice device;
++  vk::Queue queue;
++  uint32_t queueFamilyIndex{0};
++
++  vk::UniqueCommandPool commandPool;
++  vk::UniqueDescriptorSetLayout descriptorSetLayout;
++  vk::UniquePipelineLayout pipelineLayout;
++  vk::UniqueDescriptorPool descriptorPool;
++  vk::DescriptorSet descriptorSet{};
++
++  Pipelines pipelines;
++
++  Buffer d_a;
++  Buffer d_b;
++  Buffer d_c;
++  Buffer d_partial;
++  Buffer staging;
++  Buffer partialStaging;
++
++  size_t chunk_elements{0};
++  uint32_t workgroup_size{128};
++  uint32_t dot_groups{1};
++
++  std::vector<T> h_a;
++  std::vector<T> h_b;
++  std::vector<T> h_c;
++
++public:
++  VulkanStream(BenchId bs, intptr_t array_size, int device_id, T initA, T initB, T initC);
++  ~VulkanStream() override;
++
++  void copy() override;
++  void add() override;
++  void mul() override;
++  void triad() override;
++  void nstream() override;
++  T dot() override;
++
++  void init_arrays(T initA, T initB, T initC) override;
++  void get_arrays(T const*& a, T const*& b, T const*& c) override;
++
++private:
++  uint32_t findMemoryType(uint32_t typeBits, vk::MemoryPropertyFlags properties) const;
++  Buffer createBuffer(vk::DeviceSize size, vk::BufferUsageFlags usage,
++                      vk::MemoryPropertyFlags properties, bool map = false) const;
++
++  Pipelines createPipelines();
++  vk::UniquePipeline createPipeline(const std::string& entry) const;
++  std::vector<char> readShader(const std::string& entry) const;
++
++  void updateChunkDescriptors(vk::DeviceSize offset, vk::DeviceSize range);
++  void dispatch(const vk::Pipeline& pipeline, uint32_t groupsX, uint32_t elementCount);
++  void copyDeviceToHost(const Buffer& src, std::vector<T>& dst);
++
++  template <class Fn>
++  void forEachChunk(Fn&& fn);
++};
++
++void listDevices(void);
++std::string getDeviceName(const int device);
++std::string getDeviceDriver(const int device);
+diff --git a/src/vulkan/VulkanStream.cpp b/src/vulkan/VulkanStream.cpp
+new file mode 100644
+index 0000000..0000000
+--- /dev/null
++++ b/src/vulkan/VulkanStream.cpp
+@@ -0,0 +1,468 @@
++
++#include "VulkanStream.h"
++
++#include <algorithm>
++#include <array>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <iostream>
++#include <numeric>
++#include <stdexcept>
++#include <string>
++
++namespace {
++
++vk::UniqueInstance makeInstance() {
++  vk::ApplicationInfo appInfo;
++  appInfo.pApplicationName = "BabelStream";
++  appInfo.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
++  appInfo.pEngineName = "BabelStream";
++  appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
++  appInfo.apiVersion = VK_API_VERSION_1_2;
++
++  vk::InstanceCreateInfo createInfo;
++  createInfo.pApplicationInfo = &appInfo;
++
++  return vk::createInstanceUnique(createInfo);
++}
++
++std::vector<vk::PhysicalDevice> enumerateDevices(const vk::Instance& instance) {
++  return instance.enumeratePhysicalDevices();
++}
++
++uint32_t selectQueueFamily(vk::PhysicalDevice device) {
++  const auto families = device.getQueueFamilyProperties();
++
++  for (uint32_t i = 0; i < families.size(); ++i) {
++    const auto flags = families[i].queueFlags;
++    if ((flags & vk::QueueFlagBits::eCompute) && !(flags & vk::QueueFlagBits::eGraphics)) {
++      return i;
++    }
++  }
++
++  for (uint32_t i = 0; i < families.size(); ++i) {
++    if (families[i].queueFlags & vk::QueueFlagBits::eCompute) {
++      return i;
++    }
++  }
++
++  throw std::runtime_error("No compute-capable Vulkan queue family found");
++}
++
++std::string driverVersionString(uint32_t version) {
++  return std::to_string(VK_VERSION_MAJOR(version)) + "." +
++         std::to_string(VK_VERSION_MINOR(version)) + "." +
++         std::to_string(VK_VERSION_PATCH(version));
++}
++
++std::string queryDriverString(vk::PhysicalDevice device) {
++  vk::PhysicalDeviceDriverProperties driverProps;
++  vk::PhysicalDeviceProperties2 props2;
++  props2.pNext = &driverProps;
++  device.getProperties2(&props2);
++
++  if (driverProps.driverName[0] != '\0') {
++    std::string info = driverProps.driverInfo[0] != '\0' ? std::string(driverProps.driverInfo) : "";
++    return info.empty()
++      ? std::string(driverProps.driverName)
++      : std::string(driverProps.driverName) + " - " + info;
++  }
++
++  return driverVersionString(device.getProperties().driverVersion);
++}
++
++uint32_t ceilDiv(uint64_t x, uint32_t y) {
++  return static_cast<uint32_t>((x + y - 1) / y);
++}
++
++} // namespace
++
++template <class T>
++VulkanStream<T>::VulkanStream(BenchId, const intptr_t array_size, const int device_index,
++                              T initA, T initB, T initC)
++  : array_size(array_size),
++    initA_(initA),
++    initB_(initB),
++    initC_(initC),
++    scalar_(static_cast<T>(startScalar))
++{
++  instance = makeInstance();
++
++  const auto devices = enumerateDevices(*instance);
++  if (devices.empty()) {
++    throw std::runtime_error("No Vulkan physical devices found");
++  }
++  if (device_index < 0 || static_cast<size_t>(device_index) >= devices.size()) {
++    throw std::runtime_error("Invalid device index");
++  }
++
++  physicalDevice = devices[device_index];
++  queueFamilyIndex = selectQueueFamily(physicalDevice);
++
++  const auto features = physicalDevice.getFeatures();
++  if (sizeof(T) == sizeof(double) && !features.shaderFloat64) {
++    throw std::runtime_error("Device does not support double precision, please use --float");
++  }
++
++  const auto limits = physicalDevice.getProperties().limits;
++  if (limits.maxComputeWorkGroupInvocations < workgroup_size ||
++      limits.maxComputeWorkGroupSize[0] < workgroup_size) {
++    throw std::runtime_error("Selected Vulkan device does not support the required workgroup size");
++  }
++
++  const uint64_t maxRangeElems = limits.maxStorageBufferRange / sizeof(T);
++  const uint64_t maxDispatchElems = static_cast<uint64_t>(limits.maxComputeWorkGroupCount[0]) * workgroup_size;
++  chunk_elements = static_cast<size_t>(std::min<uint64_t>(
++      static_cast<uint64_t>(array_size),
++      std::min<uint64_t>(maxRangeElems, maxDispatchElems)));
++
++  if (chunk_elements == 0) {
++    throw std::runtime_error("Vulkan device cannot expose a usable storage buffer range");
++  }
++
++  dot_groups = std::max(1u, std::min(
++      limits.maxComputeWorkGroupCount[0],
++      ceilDiv(chunk_elements, workgroup_size * 4u)));
++
++  std::cout << "Using Vulkan device " << getDeviceName(device_index) << std::endl;
++  std::cout << "Driver: " << getDeviceDriver(device_index) << std::endl;
++  std::cout << "Chunk size: " << chunk_elements << " elements" << std::endl;
++  std::cout << "Reduction kernel config: " << dot_groups
++            << " groups of size " << workgroup_size << std::endl;
++
++  float queuePriority = 1.0f;
++  vk::DeviceQueueCreateInfo queueInfo;
++  queueInfo.queueFamilyIndex = queueFamilyIndex;
++  queueInfo.queueCount = 1;
++  queueInfo.pQueuePriorities = &queuePriority;
++
++  vk::PhysicalDeviceFeatures enabledFeatures{};
++  enabledFeatures.shaderFloat64 = (sizeof(T) == sizeof(double));
++
++  vk::DeviceCreateInfo deviceInfo;
++  deviceInfo.queueCreateInfoCount = 1;
++  deviceInfo.pQueueCreateInfos = &queueInfo;
++  deviceInfo.pEnabledFeatures = &enabledFeatures;
++
++  device = physicalDevice.createDeviceUnique(deviceInfo);
++  queue = device->getQueue(queueFamilyIndex, 0);
++
++  vk::CommandPoolCreateInfo poolInfo;
++  poolInfo.queueFamilyIndex = queueFamilyIndex;
++  poolInfo.flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
++  commandPool = device->createCommandPoolUnique(poolInfo);
++
++  std::array<vk::DescriptorSetLayoutBinding, 4> bindings{};
++  for (uint32_t i = 0; i < bindings.size(); ++i) {
++    bindings[i].binding = i;
++    bindings[i].descriptorType = vk::DescriptorType::eStorageBuffer;
++    bindings[i].descriptorCount = 1;
++    bindings[i].stageFlags = vk::ShaderStageFlagBits::eCompute;
++  }
++
++  vk::DescriptorSetLayoutCreateInfo setLayoutInfo;
++  setLayoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
++  setLayoutInfo.pBindings = bindings.data();
++  descriptorSetLayout = device->createDescriptorSetLayoutUnique(setLayoutInfo);
++
++  vk::PushConstantRange pushRange;
++  pushRange.stageFlags = vk::ShaderStageFlagBits::eCompute;
++  pushRange.offset = 0;
++  pushRange.size = sizeof(ShaderParams);
++
++  const vk::DescriptorSetLayout rawSetLayout = *descriptorSetLayout;
++  vk::PipelineLayoutCreateInfo pipelineLayoutInfo;
++  pipelineLayoutInfo.setLayoutCount = 1;
++  pipelineLayoutInfo.pSetLayouts = &rawSetLayout;
++  pipelineLayoutInfo.pushConstantRangeCount = 1;
++  pipelineLayoutInfo.pPushConstantRanges = &pushRange;
++  pipelineLayout = device->createPipelineLayoutUnique(pipelineLayoutInfo);
++
++  vk::DescriptorPoolSize poolSize;
++  poolSize.type = vk::DescriptorType::eStorageBuffer;
++  poolSize.descriptorCount = 4;
++
++  vk::DescriptorPoolCreateInfo poolCreateInfo;
++  poolCreateInfo.maxSets = 1;
++  poolCreateInfo.poolSizeCount = 1;
++  poolCreateInfo.pPoolSizes = &poolSize;
++  descriptorPool = device->createDescriptorPoolUnique(poolCreateInfo);
++
++  vk::DescriptorSetAllocateInfo allocInfo;
++  allocInfo.descriptorPool = *descriptorPool;
++  allocInfo.descriptorSetCount = 1;
++  allocInfo.pSetLayouts = &rawSetLayout;
++  descriptorSet = device->allocateDescriptorSets(allocInfo).front();
++
++  const vk::DeviceSize arrayBytes = sizeof(T) * static_cast<vk::DeviceSize>(array_size);
++  const vk::DeviceSize stagingBytes = sizeof(T) * static_cast<vk::DeviceSize>(chunk_elements);
++  const vk::DeviceSize partialBytes = sizeof(T) * static_cast<vk::DeviceSize>(dot_groups);
++
++  const auto deviceUsage =
++      vk::BufferUsageFlagBits::eStorageBuffer |
++      vk::BufferUsageFlagBits::eTransferSrc |
++      vk::BufferUsageFlagBits::eTransferDst;
++
++  d_a = createBuffer(arrayBytes, deviceUsage, vk::MemoryPropertyFlagBits::eDeviceLocal);
++  d_b = createBuffer(arrayBytes, deviceUsage, vk::MemoryPropertyFlagBits::eDeviceLocal);
++  d_c = createBuffer(arrayBytes, deviceUsage, vk::MemoryPropertyFlagBits::eDeviceLocal);
++  d_partial = createBuffer(partialBytes,
++                           vk::BufferUsageFlagBits::eStorageBuffer |
++                           vk::BufferUsageFlagBits::eTransferSrc,
++                           vk::MemoryPropertyFlagBits::eDeviceLocal);
++
++  staging = createBuffer(stagingBytes,
++                         vk::BufferUsageFlagBits::eTransferDst,
++                         vk::MemoryPropertyFlagBits::eHostVisible |
++                         vk::MemoryPropertyFlagBits::eHostCoherent,
++                         true);
++
++  partialStaging = createBuffer(partialBytes,
++                                vk::BufferUsageFlagBits::eTransferDst,
++                                vk::MemoryPropertyFlagBits::eHostVisible |
++                                vk::MemoryPropertyFlagBits::eHostCoherent,
++                                true);
++
++  pipelines = createPipelines();
++  init_arrays(initA, initB, initC);
++}
++
++template <class T>
++VulkanStream<T>::~VulkanStream() {
++  if (device) {
++    if (staging.mapped) {
++      device->unmapMemory(*staging.memory);
++    }
++    if (partialStaging.mapped) {
++      device->unmapMemory(*partialStaging.memory);
++    }
++  }
++}
++
++template <class T>
++uint32_t VulkanStream<T>::findMemoryType(uint32_t typeBits, vk::MemoryPropertyFlags properties) const {
++  const auto memProps = physicalDevice.getMemoryProperties();
++
++  for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
++    const bool supported = (typeBits & (1u << i)) != 0;
++    const bool matches = (memProps.memoryTypes[i].propertyFlags & properties) == properties;
++    if (supported && matches) {
++      return i;
++    }
++  }
++
++  throw std::runtime_error("Unable to find a Vulkan memory type matching requirements");
++}
++
++template <class T>
++typename VulkanStream<T>::Buffer VulkanStream<T>::createBuffer(
++    vk::DeviceSize size, vk::BufferUsageFlags usage, vk::MemoryPropertyFlags properties, bool map) const {
++  Buffer out;
++  out.size = size;
++
++  vk::BufferCreateInfo bufferInfo;
++  bufferInfo.size = size;
++  bufferInfo.usage = usage;
++  bufferInfo.sharingMode = vk::SharingMode::eExclusive;
++  out.buffer = device->createBufferUnique(bufferInfo);
++
++  const auto requirements = device->getBufferMemoryRequirements(*out.buffer);
++
++  vk::MemoryAllocateInfo allocInfo;
++  allocInfo.allocationSize = requirements.size;
++  allocInfo.memoryTypeIndex = findMemoryType(requirements.memoryTypeBits, properties);
++  out.memory = device->allocateMemoryUnique(allocInfo);
++
++  device->bindBufferMemory(*out.buffer, *out.memory, 0);
++
++  if (map) {
++    out.mapped = device->mapMemory(*out.memory, 0, size);
++  }
++
++  return out;
++}
++
++template <class T>
++std::vector<char> VulkanStream<T>::readShader(const std::string& entry) const {
++  const char* precisionDir = sizeof(T) == sizeof(double) ? "double" : "float";
++  const auto path = std::filesystem::path(VULKAN_SHADER_DIR) / precisionDir / (entry + ".spv");
++
++  std::ifstream file(path, std::ios::binary | std::ios::ate);
++  if (!file) {
++    throw std::runtime_error("Unable to open shader module: " + path.string());
++  }
++
++  const auto end = file.tellg();
++  std::vector<char> bytes(static_cast<size_t>(end));
++  file.seekg(0, std::ios::beg);
++  file.read(bytes.data(), end);
++
++  return bytes;
++}
++
++template <class T>
++vk::UniquePipeline VulkanStream<T>::createPipeline(const std::string& entry) const {
++  const auto code = readShader(entry);
++
++  vk::ShaderModuleCreateInfo moduleInfo;
++  moduleInfo.codeSize = code.size();
++  moduleInfo.pCode = reinterpret_cast<const uint32_t*>(code.data());
++  auto shaderModule = device->createShaderModuleUnique(moduleInfo);
++
++  vk::PipelineShaderStageCreateInfo stageInfo;
++  stageInfo.stage = vk::ShaderStageFlagBits::eCompute;
++  stageInfo.module = *shaderModule;
++  stageInfo.pName = entry.c_str();
++
++  vk::ComputePipelineCreateInfo pipelineInfo;
++  pipelineInfo.stage = stageInfo;
++  pipelineInfo.layout = *pipelineLayout;
++
++  return device->createComputePipelineUnique(nullptr, pipelineInfo).value;
++}
++
++template <class T>
++typename VulkanStream<T>::Pipelines VulkanStream<T>::createPipelines() {
++  Pipelines p;
++  p.init = createPipeline("init");
++  p.copy = createPipeline("copy");
++  p.mul = createPipeline("mul");
++  p.add = createPipeline("add");
++  p.triad = createPipeline("triad");
++  p.nstream = createPipeline("nstream");
++  p.dot = createPipeline("dot");
++  return p;
++}
++
++template <class T>
++void VulkanStream<T>::updateChunkDescriptors(vk::DeviceSize offset, vk::DeviceSize range) {
++  const vk::DescriptorBufferInfo aInfo(*d_a.buffer, offset, range);
++  const vk::DescriptorBufferInfo bInfo(*d_b.buffer, offset, range);
++  const vk::DescriptorBufferInfo cInfo(*d_c.buffer, offset, range);
++  const vk::DescriptorBufferInfo partialInfo(*d_partial.buffer, 0, d_partial.size);
++
++  std::array<vk::WriteDescriptorSet, 4> writes{};
++
++  writes[0].dstSet = descriptorSet;
++  writes[0].dstBinding = 0;
++  writes[0].descriptorCount = 1;
++  writes[0].descriptorType = vk::DescriptorType::eStorageBuffer;
++  writes[0].pBufferInfo = &aInfo;
++
++  writes[1].dstSet = descriptorSet;
++  writes[1].dstBinding = 1;
++  writes[1].descriptorCount = 1;
++  writes[1].descriptorType = vk::DescriptorType::eStorageBuffer;
++  writes[1].pBufferInfo = &bInfo;
++
++  writes[2].dstSet = descriptorSet;
++  writes[2].dstBinding = 2;
++  writes[2].descriptorCount = 1;
++  writes[2].descriptorType = vk::DescriptorType::eStorageBuffer;
++  writes[2].pBufferInfo = &cInfo;
++
++  writes[3].dstSet = descriptorSet;
++  writes[3].dstBinding = 3;
++  writes[3].descriptorCount = 1;
++  writes[3].descriptorType = vk::DescriptorType::eStorageBuffer;
++  writes[3].pBufferInfo = &partialInfo;
++
++  device->updateDescriptorSets(writes, {});
++}
++
++template <class T>
++void VulkanStream<T>::dispatch(const vk::Pipeline& pipeline, uint32_t groupsX, uint32_t elementCount) {
++  vk::CommandBufferAllocateInfo allocInfo;
++  allocInfo.commandPool = *commandPool;
++  allocInfo.level = vk::CommandBufferLevel::ePrimary;
++  allocInfo.commandBufferCount = 1;
++  auto commands = device->allocateCommandBuffersUnique(allocInfo);
++  auto& cmd = commands.front();
++
++  vk::CommandBufferBeginInfo beginInfo;
++  beginInfo.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
++  cmd->begin(beginInfo);
++
++  cmd->bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
++  cmd->bindDescriptorSets(vk::PipelineBindPoint::eCompute, *pipelineLayout, 0, descriptorSet, {});
++
++  const ShaderParams params{
++      elementCount,
++      groupsX * workgroup_size,
++      initA_,
++      initB_,
++      initC_,
++      scalar_
++  };
++
++  cmd->pushConstants(*pipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(params), &params);
++  cmd->dispatch(groupsX, 1, 1);
++
++  vk::MemoryBarrier barrier(
++      vk::AccessFlagBits::eShaderWrite,
++      vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite);
++
++  cmd->pipelineBarrier(
++      vk::PipelineStageFlagBits::eComputeShader,
++      vk::PipelineStageFlagBits::eComputeShader,
++      {}, {barrier}, {}, {});
++
++  cmd->end();
++
++  const vk::CommandBuffer raw = *cmd;
++  vk::SubmitInfo submitInfo;
++  submitInfo.commandBufferCount = 1;
++  submitInfo.pCommandBuffers = &raw;
++
++  queue.submit(submitInfo, nullptr);
++  queue.waitIdle();
++}
++
++template <class T>
++template <class Fn>
++void VulkanStream<T>::forEachChunk(Fn&& fn) {
++  for (size_t offset = 0; offset < static_cast<size_t>(array_size); offset += chunk_elements) {
++    const size_t count = std::min(chunk_elements, static_cast<size_t>(array_size) - offset);
++    fn(offset, count);
++  }
++}
++
++template <class T>
++void VulkanStream<T>::copy() {
++  forEachChunk([&](size_t offset, size_t count) {
++    updateChunkDescriptors(offset * sizeof(T), count * sizeof(T));
++    dispatch(*pipelines.copy, ceilDiv(count, workgroup_size), static_cast<uint32_t>(count));
++  });
++}
++
++template <class T>
++void VulkanStream<T>::mul() {
++  forEachChunk([&](size_t offset, size_t count) {
++    updateChunkDescriptors(offset * sizeof(T), count * sizeof(T));
++    dispatch(*pipelines.mul, ceilDiv(count, workgroup_size), static_cast<uint32_t>(count));
++  });
++}
++
++template <class T>
++void VulkanStream<T>::add() {
++  forEachChunk([&](size_t offset, size_t count) {
++    updateChunkDescriptors(offset * sizeof(T), count * sizeof(T));
++    dispatch(*pipelines.add, ceilDiv(count, workgroup_size), static_cast<uint32_t>(count));
++  });
++}
++
++template <class T>
++void VulkanStream<T>::triad() {
++  forEachChunk([&](size_t offset, size_t count) {
++    updateChunkDescriptors(offset * sizeof(T), count * sizeof(T));
++    dispatch(*pipelines.triad, ceilDiv(count, workgroup_size), static_cast<uint32_t>(count));
++  });
++}
++
++template <class T>
++void VulkanStream<T>::nstream() {
++  forEachChunk([&](size_t offset, size_t count) {
++    updateChunkDescriptors(offset * sizeof(T), count * sizeof(T));
++    dispatch(*pipelines.nstream, ceilDiv(count, workgroup_size), static_cast<uint32_t>(count));
++  });
++}
++
++template <class T>
++T VulkanStream<T>::dot() {
++  T total{};
++
++  forEachChunk([&](size_t offset, size_t count) {
++    updateChunkDescriptors(offset * sizeof(T), count * sizeof(T));
++
++    vk::CommandBufferAllocateInfo allocInfo;
++    allocInfo.commandPool = *commandPool;
++    allocInfo.level = vk::CommandBufferLevel::ePrimary;
++    allocInfo.commandBufferCount = 1;
++    auto commands = device->allocateCommandBuffersUnique(allocInfo);
++    auto& cmd = commands.front();
++
++    vk::CommandBufferBeginInfo beginInfo;
++    beginInfo.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
++    cmd->begin(beginInfo);
++
++    cmd->bindPipeline(vk::PipelineBindPoint::eCompute, *pipelines.dot);
++    cmd->bindDescriptorSets(vk::PipelineBindPoint::eCompute, *pipelineLayout, 0, descriptorSet, {});
++
++    const ShaderParams params{
++        static_cast<uint32_t>(count),
++        dot_groups * workgroup_size,
++        initA_,
++        initB_,
++        initC_,
++        scalar_
++    };
++
++    cmd->pushConstants(*pipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(params), &params);
++    cmd->dispatch(dot_groups, 1, 1);
++
++    vk::MemoryBarrier computeToTransfer(
++        vk::AccessFlagBits::eShaderWrite,
++        vk::AccessFlagBits::eTransferRead);
++    cmd->pipelineBarrier(
++        vk::PipelineStageFlagBits::eComputeShader,
++        vk::PipelineStageFlagBits::eTransfer,
++        {}, {computeToTransfer}, {}, {});
++
++    vk::BufferCopy copyRegion(0, 0, d_partial.size);
++    cmd->copyBuffer(*d_partial.buffer, *partialStaging.buffer, copyRegion);
++
++    vk::MemoryBarrier transferToHost(
++        vk::AccessFlagBits::eTransferWrite,
++        vk::AccessFlagBits::eHostRead);
++    cmd->pipelineBarrier(
++        vk::PipelineStageFlagBits::eTransfer,
++        vk::PipelineStageFlagBits::eHost,
++        {}, {transferToHost}, {}, {});
++
++    cmd->end();
++
++    const vk::CommandBuffer raw = *cmd;
++    vk::SubmitInfo submitInfo;
++    submitInfo.commandBufferCount = 1;
++    submitInfo.pCommandBuffers = &raw;
++
++    queue.submit(submitInfo, nullptr);
++    queue.waitIdle();
++
++    const T* partials = static_cast<const T*>(partialStaging.mapped);
++    total += std::accumulate(partials, partials + dot_groups, T{});
++  });
++
++  return total;
++}
++
++template <class T>
++void VulkanStream<T>::init_arrays(T initA, T initB, T initC) {
++  initA_ = initA;
++  initB_ = initB;
++  initC_ = initC;
++
++  forEachChunk([&](size_t offset, size_t count) {
++    updateChunkDescriptors(offset * sizeof(T), count * sizeof(T));
++    dispatch(*pipelines.init, ceilDiv(count, workgroup_size), static_cast<uint32_t>(count));
++  });
++}
++
++template <class T>
++void VulkanStream<T>::copyDeviceToHost(const Buffer& src, std::vector<T>& dst) {
++  dst.resize(array_size);
++
++  forEachChunk([&](size_t offset, size_t count) {
++    vk::CommandBufferAllocateInfo allocInfo;
++    allocInfo.commandPool = *commandPool;
++    allocInfo.level = vk::CommandBufferLevel::ePrimary;
++    allocInfo.commandBufferCount = 1;
++    auto commands = device->allocateCommandBuffersUnique(allocInfo);
++    auto& cmd = commands.front();
++
++    vk::CommandBufferBeginInfo beginInfo;
++    beginInfo.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
++    cmd->begin(beginInfo);
++
++    vk::MemoryBarrier computeToTransfer(
++        vk::AccessFlagBits::eShaderWrite,
++        vk::AccessFlagBits::eTransferRead);
++    cmd->pipelineBarrier(
++        vk::PipelineStageFlagBits::eComputeShader,
++        vk::PipelineStageFlagBits::eTransfer,
++        {}, {computeToTransfer}, {}, {});
++
++    vk::BufferCopy region(offset * sizeof(T), 0, count * sizeof(T));
++    cmd->copyBuffer(*src.buffer, *staging.buffer, region);
++
++    vk::MemoryBarrier transferToHost(
++        vk::AccessFlagBits::eTransferWrite,
++        vk::AccessFlagBits::eHostRead);
++    cmd->pipelineBarrier(
++        vk::PipelineStageFlagBits::eTransfer,
++        vk::PipelineStageFlagBits::eHost,
++        {}, {transferToHost}, {}, {});
++
++    cmd->end();
++
++    const vk::CommandBuffer raw = *cmd;
++    vk::SubmitInfo submitInfo;
++    submitInfo.commandBufferCount = 1;
++    submitInfo.pCommandBuffers = &raw;
++
++    queue.submit(submitInfo, nullptr);
++    queue.waitIdle();
++
++    std::memcpy(dst.data() + offset, staging.mapped, count * sizeof(T));
++  });
++}
++
++template <class T>
++void VulkanStream<T>::get_arrays(T const*& a, T const*& b, T const*& c) {
++  copyDeviceToHost(d_a, h_a);
++  copyDeviceToHost(d_b, h_b);
++  copyDeviceToHost(d_c, h_c);
++
++  a = h_a.data();
++  b = h_b.data();
++  c = h_c.data();
++}
++
++void listDevices(void) {
++  auto instance = makeInstance();
++  const auto devices = enumerateDevices(*instance);
++
++  if (devices.empty()) {
++    std::cerr << "No devices found." << std::endl;
++    return;
++  }
++
++  std::cout << "\nDevices:" << std::endl;
++  for (size_t i = 0; i < devices.size(); ++i) {
++    std::cout << i << ": " << devices[i].getProperties().deviceName << std::endl;
++  }
++  std::cout << std::endl;
++}
++
++std::string getDeviceName(const int device) {
++  auto instance = makeInstance();
++  const auto devices = enumerateDevices(*instance);
++
++  if (device < 0 || static_cast<size_t>(device) >= devices.size()) {
++    throw std::runtime_error("Error asking for name for non-existent device");
++  }
++
++  return devices[device].getProperties().deviceName;
++}
++
++std::string getDeviceDriver(const int device) {
++  auto instance = makeInstance();
++  const auto devices = enumerateDevices(*instance);
++
++  if (device < 0 || static_cast<size_t>(device) >= devices.size()) {
++    throw std::runtime_error("Error asking for driver for non-existent device");
++  }
++
++  return queryDriverString(devices[device]);
++}
++
++template class VulkanStream<float>;
++template class VulkanStream<double>;
+diff --git a/src/vulkan/stream.slang b/src/vulkan/stream.slang
+new file mode 100644
+index 0000000..0000000
+--- /dev/null
++++ b/src/vulkan/stream.slang
+@@ -0,0 +1,95 @@
++#if USE_DOUBLE
++typedef double StreamType;
++#else
++typedef float StreamType;
++#endif
++
++static const uint WORKGROUP_SIZE = 128;
++
++struct PushConstants
++{
++    uint elementCount;
++    uint gridSize;
++    StreamType initA;
++    StreamType initB;
++    StreamType initC;
++    StreamType scalar;
++};
++
++[[vk::push_constant]]
++ConstantBuffer<PushConstants> gParams;
++
++[[vk::binding(0, 0)]] RWStructuredBuffer<StreamType> gA;
++[[vk::binding(1, 0)]] RWStructuredBuffer<StreamType> gB;
++[[vk::binding(2, 0)]] RWStructuredBuffer<StreamType> gC;
++[[vk::binding(3, 0)]] RWStructuredBuffer<StreamType> gPartial;
++
++groupshared StreamType scratch[WORKGROUP_SIZE];
++
++[numthreads(WORKGROUP_SIZE, 1, 1)]
++void init(uint3 tid : SV_DispatchThreadID)
++{
++    if (tid.x >= gParams.elementCount) return;
++    gA[tid.x] = gParams.initA;
++    gB[tid.x] = gParams.initB;
++    gC[tid.x] = gParams.initC;
++}
++
++[numthreads(WORKGROUP_SIZE, 1, 1)]
++void copy(uint3 tid : SV_DispatchThreadID)
++{
++    if (tid.x >= gParams.elementCount) return;
++    gC[tid.x] = gA[tid.x];
++}
++
++[numthreads(WORKGROUP_SIZE, 1, 1)]
++void mul(uint3 tid : SV_DispatchThreadID)
++{
++    if (tid.x >= gParams.elementCount) return;
++    gB[tid.x] = gParams.scalar * gC[tid.x];
++}
++
++[numthreads(WORKGROUP_SIZE, 1, 1)]
++void add(uint3 tid : SV_DispatchThreadID)
++{
++    if (tid.x >= gParams.elementCount) return;
++    gC[tid.x] = gA[tid.x] + gB[tid.x];
++}
++
++[numthreads(WORKGROUP_SIZE, 1, 1)]
++void triad(uint3 tid : SV_DispatchThreadID)
++{
++    if (tid.x >= gParams.elementCount) return;
++    gA[tid.x] = gB[tid.x] + gParams.scalar * gC[tid.x];
++}
++
++[numthreads(WORKGROUP_SIZE, 1, 1)]
++void nstream(uint3 tid : SV_DispatchThreadID)
++{
++    if (tid.x >= gParams.elementCount) return;
++    gA[tid.x] += gB[tid.x] + gParams.scalar * gC[tid.x];
++}
++
++[numthreads(WORKGROUP_SIZE, 1, 1)]
++void dot(
++    uint3 dispatchThreadID : SV_DispatchThreadID,
++    uint3 groupThreadID : SV_GroupThreadID,
++    uint3 groupID : SV_GroupID)
++{
++    StreamType local = 0;
++
++    for (uint i = dispatchThreadID.x; i < gParams.elementCount; i += gParams.gridSize)
++    {
++        local += gA[i] * gB[i];
++    }
++
++    scratch[groupThreadID.x] = local;
++    GroupMemoryBarrierWithGroupSync();
++
++    for (uint offset = WORKGROUP_SIZE >> 1; offset > 0; offset >>= 1)
++    {
++        if (groupThreadID.x < offset)
++        {
++            scratch[groupThreadID.x] += scratch[groupThreadID.x + offset];
++        }
++        GroupMemoryBarrierWithGroupSync();
++    }
++
++    if (groupThreadID.x == 0)
++    {
++        gPartial[groupID.x] = scratch[0];
++    }
++}
