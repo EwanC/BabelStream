@@ -1,16 +1,14 @@
-diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 8c35479..0000000 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -161,6 +161,7 @@ register_model(serial SERIAL SerialStream.cpp)
+@@ -161,6 +161,7 @@
+ register_model(serial SERIAL SerialStream.cpp)
  register_model(omp OMP OMPStream.cpp)
  register_model(ocl OCL OCLStream.cpp)
 +register_model(vulkan VULKAN VulkanStream.cpp)
  register_model(std STD STDStream.cpp)
  register_model(hip HIP HIPStream.cpp)
  register_model(cuda CUDA CUDAStream.cu)
-diff --git a/src/StreamModels.h b/src/StreamModels.h
-index 5268f2d..0000000 100644
+
 --- a/src/StreamModels.h
 +++ b/src/StreamModels.h
 @@ -15,6 +15,8 @@
@@ -22,23 +20,21 @@ index 5268f2d..0000000 100644
  #elif defined(USE_RAJA)
  #include "RAJAStream.hpp"
  #elif defined(KOKKOS)
-@@ -50,6 +52,10 @@ std::unique_ptr<Stream<T>> make_stream(Args... args) {
+@@ -50,6 +52,10 @@
+ #elif defined(OCL)
    // Use the OpenCL implementation
    return std::make_unique<OCLStream<T>>(args...);
- 
++
 +#elif defined(VULKAN)
 +  // Use the Vulkan implementation
 +  return std::make_unique<VulkanStream<T>>(args...);
-+
+ 
  #elif defined(USE_RAJA)
    // Use the RAJA implementation
-   return std::make_unique<RAJAStream<T>>(args...);
-diff --git a/src/vulkan/model.cmake b/src/vulkan/model.cmake
-new file mode 100644
-index 0000000..0000000
+
 --- /dev/null
 +++ b/src/vulkan/model.cmake
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,60 @@
 +
 +register_flag_optional(CMAKE_CXX_COMPILER
 +        "Any CXX compiler that is supported by CMake detection"
@@ -97,14 +93,12 @@ index 0000000..0000000
 +
 +    add_custom_target(${NAME}_slang_shaders DEPENDS ${_outputs})
 +    add_dependencies(${NAME} ${NAME}_slang_shaders)
-+    target_compile_definitions(${NAME} PRIVATE VULKAN_SHADER_DIR=\"${_shader_dir}\")
++    target_compile_definitions(${NAME} PRIVATE VULKAN_SHADER_DIR="${_shader_dir}")
 +endmacro()
-diff --git a/src/vulkan/VulkanStream.h b/src/vulkan/VulkanStream.h
-new file mode 100644
-index 0000000..0000000
+
 --- /dev/null
 +++ b/src/vulkan/VulkanStream.h
-@@ -0,0 +1,90 @@
+@@ -0,0 +1,111 @@
 +
 +#pragma once
 +
@@ -216,12 +210,10 @@ index 0000000..0000000
 +void listDevices(void);
 +std::string getDeviceName(const int device);
 +std::string getDeviceDriver(const int device);
-diff --git a/src/vulkan/VulkanStream.cpp b/src/vulkan/VulkanStream.cpp
-new file mode 100644
-index 0000000..0000000
+
 --- /dev/null
 +++ b/src/vulkan/VulkanStream.cpp
-@@ -0,0 +1,468 @@
+@@ -0,0 +1,651 @@
 +
 +#include "VulkanStream.h"
 +
@@ -873,12 +865,10 @@ index 0000000..0000000
 +
 +template class VulkanStream<float>;
 +template class VulkanStream<double>;
-diff --git a/src/vulkan/stream.slang b/src/vulkan/stream.slang
-new file mode 100644
-index 0000000..0000000
+
 --- /dev/null
 +++ b/src/vulkan/stream.slang
-@@ -0,0 +1,95 @@
+@@ -0,0 +1,102 @@
 +#if USE_DOUBLE
 +typedef double StreamType;
 +#else
